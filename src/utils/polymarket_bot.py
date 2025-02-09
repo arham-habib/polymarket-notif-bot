@@ -27,7 +27,6 @@ logger = logging.getLogger(__name__)
 
 class PolymarketNotifBot:
 
-
     def __init__(
             self,
             bot_token: str,
@@ -89,6 +88,7 @@ class PolymarketNotifBot:
         logger.info(f"{len(tracked_new_markets)} new tracked markets, {len(closed_markets)} closed tracked markets")
         logger.info(f"Last 5 pages scanned: {self.cursors[-5:]}")
         logger.info(f"{len(self.markets)} markets in memory")
+
         self._send_market_notification(tracked_new_markets, new=True)
         self._send_market_notification(closed_markets, new=False)
 
@@ -108,6 +108,7 @@ class PolymarketNotifBot:
         }
         market_histories = {}
         
+        # TODO: look at the other token too
         for condition_id, market in tqdm(self.markets.items(), desc="Checking market histories", unit="market"):
             token1 = market["tokens"][0]["token_id"]
             token2 = market["tokens"][0]["token_id"]
@@ -118,17 +119,16 @@ class PolymarketNotifBot:
             if history:
                 market_histories[condition_id] = history
 
-        # Check each configured interval using the cached history
         for interval, threshold in self.config.items():
             if interval not in interval_map:
                 continue 
             interval_start = current_ts - interval_map[interval]
             
-            # Track largest price change for this interval
             max_price_change = 0
             max_change_market = None
             max_change_data = None
             
+            # TODO: make this a method
             for condition_id, history in market_histories.items():
                 interval_data = [
                     price['p'] for price in history['history']
@@ -137,20 +137,20 @@ class PolymarketNotifBot:
                 if not interval_data:
                     continue
                     
-                # Check if price difference exceeds threshold
-                price_diff = max(interval_data) - min(interval_data)
-                
-                # Track largest price change
+                price_diff = max(interval_data) - min(interval_data)   
+
                 if price_diff > max_price_change:
                     max_price_change = price_diff
                     max_change_market = self.markets[condition_id]
                     max_change_data = interval_data
                 
+                # TODO: make this a method
                 if price_diff >= threshold:
                     market = self.markets[condition_id]
                     logger.info(f"Price change recorded for market {condition_id} over {interval}")
                     msg = f"⚠️ Price Change Alert!\n\n"
                     msg += f"Market: {market['question']}\n"
+                    msg += f"Condition ID: {market['condition_id']}\n"
                     msg += f"Price changed by {price_diff:.3f} in last {interval}\n"
                     msg += f"Range: {min(interval_data):.3f} - {max(interval_data):.3f}"
                     self._safe_send_message(self.bot, self.chat_id, msg)
@@ -159,12 +159,14 @@ class PolymarketNotifBot:
                     self.markets[condition_id]["last_notification"] = current_ts
             
             # Log the largest price change for this interval
-            if max_change_market:
+            if max_change_data and max_change_market:
                 logger.info(
                     f"Largest {interval} price change: {max_price_change:.3f} "
-                    f"for market: {max_change_market['question']} "
+                    f"for market: {polymarket_format_market(max_change_market)} "
                     f"(Range: {min(max_change_data):.3f} - {max(max_change_data):.3f})"
                 )
+            else:
+                logger.info(f"No price changes found for interval {interval}")
 
 
     def _get_tracked_markets(self, markets: dict):
@@ -214,16 +216,16 @@ class PolymarketNotifBot:
         return markets, cursors_collected
     
 
-    def _get_price_history(self, token_id: str, start_ts: int, end_ts: int) -> dict:
+    def _get_price_history(self, token_id: str, start_ts: int, end_ts: int, fidelity: int = 5) -> dict:
         """Get price history for a market between timestamps"""
         try:
             response = requests.get(
-                f"{POLYMARKET_GAMMA_HOST}/prices-history",
+                f"{POLYMARKET_HOST}/prices-history",
                 params={
                     "market": token_id,
                     "startTs": start_ts, 
                     "endTs": end_ts,
-                    "fidelity": 1
+                    "fidelity": fidelity
                 }
             )
             if response.status_code == 200:
@@ -333,7 +335,7 @@ class PolymarketNotifBot:
             # "/volume <min> - List markets with volume above threshold\n"
             # "/spread <max> - List markets with bid-ask spread below threshold"
         )
-
+    
 
     def start(self):
         """Start the bot and keep scheduling running."""
