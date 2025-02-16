@@ -1,5 +1,5 @@
 import json
-import os
+import pandas as pd
 import time
 import schedule
 import requests
@@ -14,7 +14,6 @@ from telegram.error import TimedOut, NetworkError
 
 #############################################################
 # Polymarket is indexed on a "condition_id"
-POLYMARKET_FILEPATH = os.path.join(os.path.dirname(__file__), "..", "..", "data", "polymarket")
 POLYMARKET_HOST = "https://clob.polymarket.com"
 POLYMARKET_GAMMA_HOST = "https://gamma-api.polymarket.com"
 #############################################################
@@ -23,6 +22,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s] %(levelname)s - %(name)s - %(message)s'
 )
+
 logger = logging.getLogger(__name__)
 
 class PolymarketNotifBot:
@@ -110,29 +110,28 @@ class PolymarketNotifBot:
         current_ts = int(datetime.now().timestamp())
         
         # keeping the for loop for now to get TQDM support (unsure if thats necessary)
-        for condition_id, market in tqdm(self.markets.items(), desc="Checking market histories", unit="market"):
+        for condition_id, market in tqdm(list(self.markets.items()), desc="Checking market histories", unit="market"):
             token1 = market["tokens"][0]
             token2 = market["tokens"][1]
 
             yes_token = token1["token_id"] if token1["outcome"] == "Yes" else token2["token_id"]
             no_token = token1["token_id"] if token1["outcome"] == "No" else token2["token_id"]
-            
-            # Use last notification timestamp if exists, otherwise look back 1 day
-            last_notification_timestamp = market.get("last_notification", current_ts - self.INTERVAL_MAP['1d'])
-            last_checked_timestamp = market.get("price_history", {}).get("yes_history", {}).get("history", [{}])[-1].get("t", 0)
-            start_ts = max(last_notification_timestamp, last_checked_timestamp, current_ts-self.INTERVAL_MAP["1d"])
+            yes_history = self._get_price_history(yes_token, "1d")
+            no_history = self._get_price_history(no_token, "1d")
 
-            yes_history = self._get_price_history(yes_token, start_ts, current_ts)
-            no_history = self._get_price_history(no_token, start_ts, current_ts)
+            if not yes_history.empty and not no_history.empty:
+                if "price_history" in self.markets[condition_id]:
+                    self.markets[condition_id]["price_history"]["yes_history"] = yes_history
+                    self.markets[condition_id]["price_history"]["no_history"] = yes_history
 
-            if yes_history and no_history:
-                self.markets[condition_id]["price_history"] = {"yes_history": yes_history, "no_history": no_history}
+                else:
+                    self.markets[condition_id]["price_history"] = {"yes_history": yes_history, "no_history": no_history}
 
-            # TODO: add logic to figure out when a market is closed
-            self._market_price_changes()
+        # TODO: add logic to figure out when a market is closed
+        self._market_price_changes()
         
 
-    def _market_price_changes(self, market_histories: dict):
+    def _market_price_changes(self):
         """Figure out if any of the markets have changed in excess of defined thresholds"""
         current_ts = int(datetime.now().timestamp())
 
@@ -141,46 +140,38 @@ class PolymarketNotifBot:
                 continue 
             interval_start = current_ts - self.INTERVAL_MAP[interval]
             
-            max_price_change = 0
-            max_change_market = None
-            max_change_data = None
-            
-            for condition_id, market in self.markets.items():
-                try:
-                    interval_start_market = max(interval_start, market.get("last_notification", 0))
-                    yes_interval_data = [
-                        price['p'] for price in market["price_history"]["yes_history"]
-                        if interval_start_market <= price['t'] <= current_ts
-                    ]
-                    no_interval_data = [
-                        price['p'] for price in market["price_history"]["yes_history"]
-                        if interval_start_market <= price['t'] <= current_ts
-                    ]
-                    if not yes_interval_data and no_interval_data:
-                        continue
-                        
-                    price_diff = min(max(yes_interval_data) - min(yes_interval_data), max(no_interval_data) - min(no_interval_data))  # make sure the diff happened in both markets
-                    if price_diff > max_price_change:
-                        max_price_change = price_diff
-                        max_change_market = self.markets[condition_id]
-                        max_change_data = yes_interval_data
-                    
-                    if price_diff >= threshold:
-                        self._send_price_notification(market, condition_id, yes_interval_data, no_interval_data, interval_start_market, interval)
-                        self.markets[condition_id]["last_notification"] = current_ts
+            for condition_id, market in tqdm(self.markets.items(), desc=f"Checking {interval} price changes", unit="market"):
+                self._get_price_change(condition_id, market, interval, interval_start, current_ts, threshold)
 
-                except Exception as e: 
-                    logger.error(e, " on ", polymarket_format_market(market))
+
+    def _get_price_change(self, condition_id: str, market: dict, interval: int, interval_start: int, current_ts: int, threshold: float):
+        """Get whether market price fluctuations have exceeded the threshold"""
+        
+        if "price_history" not in market:
+            return
+        try:
+            interval_start_market = max(interval_start, market.get("last_notification", 0))
+            # If already recently notified (potentially over a different lookback window), don't notify again
+            if (current_ts - interval_start_market) <= 10:
+                logger.info(f"Already notified for market {condition_id}")
+                pass
             
-            # Log the largest price change for this interval
-            if max_change_data and max_change_market:
-                logger.info(
-                    f"Largest {interval} price change: {max_price_change:.3f} "
-                    f"for market: {polymarket_format_market(max_change_market)} "
-                    f"(Range: {min(max_change_data):.3f} - {max(max_change_data):.3f})"
-                )
-            else:
-                logger.info(f"No price changes found for interval {interval}")
+            yes_interval_data = market["price_history"]["yes_history"].loc[interval_start_market:current_ts]
+            no_interval_data = market["price_history"]["yes_history"].loc[interval_start_market:current_ts]
+
+            if  yes_interval_data.empty and not no_interval_data.empty:
+                logger.error(f"Either yes or no price data is missing for {condition_id}")
+
+            price_diff = min(yes_interval_data.max() - yes_interval_data.min(), no_interval_data.max() - no_interval_data.min())  # make sure the diff happened in both markets
+            print(f"{price_diff} for market {condition_id}")
+
+            if price_diff >= threshold:
+                self._send_price_notification(market, condition_id, yes_interval_data, no_interval_data, interval_start_market, interval)
+                self.markets[condition_id]["last_notification"] = current_ts
+
+        except Exception as e: 
+            logger.error(f"Error on {condition_id}: {str(e)}")
+            return
 
 
     def _get_tracked_markets(self, markets: dict):
@@ -224,24 +215,47 @@ class PolymarketNotifBot:
         return markets, cursors_collected
     
 
-    def _get_price_history(self, token_id: str, start_ts: int, end_ts: int, fidelity: int = 5) -> dict:
-        """Get price history for a market between timestamps"""
+    def _get_price_history(self, token_id: str, interval: str = None, start_ts: int = None, end_ts: int = None, fidelity: int = 5) -> dict:
+        """Get price history for a market using either an interval or timestamp range
+        
+        Args:
+            token_id: The CLOB token ID
+            interval: Time interval - one of "1m", "1w", "1d", "6h", "1h", "max"
+            start_ts: Start timestamp (UTC) - mutually exclusive with interval
+            end_ts: End timestamp (UTC) - mutually exclusive with interval
+            fidelity: Resolution of data in minutes
+        """
+        if not interval and not (start_ts and end_ts):
+            raise ValueError("Must provide either interval or both start_ts and end_ts")
+        if interval and (start_ts or end_ts):
+            raise ValueError("Cannot provide both interval and timestamps")
+
         try:
+            params = {
+                "market": token_id,
+                "fidelity": fidelity
+            }
+            
+            if interval:
+                params["interval"] = interval
+            else:
+                params["startTs"] = start_ts
+                params["endTs"] = end_ts
+
             response = requests.get(
                 f"{POLYMARKET_HOST}/prices-history",
-                params={
-                    "market": token_id,
-                    "startTs": start_ts, 
-                    "endTs": end_ts,
-                    "fidelity": fidelity
-                }
+                params=params
             )
             if response.status_code == 200:
-                return response.json()
+                data = response.json()
+                df = pd.Series(
+                    [d['p'] for d in data['history']], 
+                    index=[d['t'] for d in data['history']]
+                )
+                return df
         except (requests.RequestException, ValueError) as e:
-            print(f"Error fetching price history for {token_id}: {str(e)}")
+            logger.error(f"Error fetching price history for {token_id}: {str(e)}")
         return None
-    
 
     def _send_market_notification(self, changed_markets: dict, new: bool):
         """Send notifications of new or closed markets, new is a boolean for which notif to send"""
@@ -255,46 +269,40 @@ class PolymarketNotifBot:
 
             self._safe_send_message(self.bot, self.chat_id, text)
 
-    
-    def _send_price_notification(self, market: dict, condition_id: str, yes_interval_data: list[int], no_interval_data: list[int], interval_start_market: int, interval: int):
+    def _send_price_notification(self, market: dict, condition_id: str, yes_interval_data: pd.Series, no_interval_data: pd.Series, interval_start_market: int, interval: int):
         """Sent a notification about the changed market"""
         logger.info(f"Price change recorded for market {condition_id} over {interval}")
 
-        # Find indices of max and min prices for YES token
-        yes_idx_max = yes_interval_data.index(max(yes_interval_data))
-        yes_idx_min = yes_interval_data.index(min(yes_interval_data))
-        no_idx_max = no_interval_data.index(max(no_interval_data))
-        no_idx_min = no_interval_data.index(min(no_interval_data))
+        # Find max and min prices and their timestamps for YES token
+        yes_max_price = yes_interval_data.max()
+        yes_min_price = yes_interval_data.min()
+        yes_max_time = datetime.fromtimestamp(yes_interval_data.idxmax())
+        yes_min_time = datetime.fromtimestamp(yes_interval_data.idxmin())
 
-        # Convert timestamps to datetime for YES token extremes
-        yes_max_time = datetime.fromtimestamp(interval_start_market + (yes_idx_max * interval))
-        yes_min_time = datetime.fromtimestamp(interval_start_market + (yes_idx_min * interval))
-        no_max_time = datetime.fromtimestamp(interval_start_market + (no_idx_max * interval))
-        no_min_time = datetime.fromtimestamp(interval_start_market + (no_idx_min * interval))
+        # Find max and min prices and their timestamps for NO token 
+        no_max_price = no_interval_data.max()
+        no_min_price = no_interval_data.min()
+        no_max_time = datetime.fromtimestamp(no_interval_data.idxmax())
+        no_min_time = datetime.fromtimestamp(no_interval_data.idxmin())
 
-        # Calculate price changes based on most recent value compared to earlier value
-        yes_latest = yes_interval_data[-1]
-        yes_earliest = yes_interval_data[0]
-        yes_price_change = yes_latest - yes_earliest
+        # Calculate price changes based on most recent value compared to earliest value
+        yes_price_change = yes_interval_data.iloc[-1] - yes_interval_data.iloc[0]
+        no_price_change = no_interval_data.iloc[-1] - no_interval_data.iloc[0]
 
-        no_latest = no_interval_data[-1]
-        no_earliest = no_interval_data[0]
-        no_price_change = no_latest - no_earliest
-
-        msg = f"⚠️ Price Change Alert over {interval} seconds:\n\n"
+        msg = f"⚠️ Price Change Alert over {interval}:\n"
         msg += f"Market: {market['question']}\n"
         msg += f"Condition ID: {market['condition_id']}\n"
         msg += f"\nYES Token:\n"
-        msg += f"Max: {max(yes_interval_data):.3f} at {yes_max_time.strftime('%H:%M:%S')}\n"
-        msg += f"Min: {min(yes_interval_data):.3f} at {yes_min_time.strftime('%H:%M:%S')}\n"
+        msg += f"Max: {yes_max_price:.3f} at {yes_max_time.strftime('%H:%M:%S')}\n"
+        msg += f"Min: {yes_min_price:.3f} at {yes_min_time.strftime('%H:%M:%S')}\n"
         msg += f"Change: {'+' if yes_price_change > 0 else ''}{yes_price_change:.3f}\n"
         msg += f"\nNO Token:\n"
-        msg += f"Max: {max(no_interval_data):.3f} at {no_max_time.strftime('%H:%M:%S')}\n" 
-        msg += f"Min: {min(no_interval_data):.3f} at {no_min_time.strftime('%H:%M:%S')}\n"
+        msg += f"Max: {no_max_price:.3f} at {no_max_time.strftime('%H:%M:%S')}\n"
+        msg += f"Min: {no_min_price:.3f} at {no_min_time.strftime('%H:%M:%S')}\n"
         msg += f"Change: {'+' if no_price_change > 0 else ''}{no_price_change:.3f}\n"
 
         self._safe_send_message(self.bot, self.chat_id, msg)
-        
+
 
     def _update_config(self, param: str, new_config: str) -> str:
         """Update the config dictionary from a Telegram command."""
