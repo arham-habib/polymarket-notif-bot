@@ -1,11 +1,16 @@
 import json
-import os
+import pandas as pd
 import time
 import schedule
 import requests
 import logging
 from tqdm import tqdm, trange
 from datetime import datetime
+import asyncio
+import aiohttp
+import random  # for optional random sleeps
+from concurrent.futures import ThreadPoolExecutor
+from typing import Tuple, Dict, Any
 
 from py_clob_client.client import ClobClient
 from telegram import Bot, Update
@@ -14,7 +19,6 @@ from telegram.error import TimedOut, NetworkError
 
 #############################################################
 # Polymarket is indexed on a "condition_id"
-POLYMARKET_FILEPATH = os.path.join(os.path.dirname(__file__), "..", "..", "data", "polymarket")
 POLYMARKET_HOST = "https://clob.polymarket.com"
 POLYMARKET_GAMMA_HOST = "https://gamma-api.polymarket.com"
 #############################################################
@@ -23,10 +27,22 @@ logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s] %(levelname)s - %(name)s - %(message)s'
 )
+
 logger = logging.getLogger(__name__)
+
+# Concurrency limit to avoid rate-limiting
+MAX_CONCURRENT_REQUESTS = 5
 
 class PolymarketNotifBot:
 
+    INTERVAL_MAP = {
+        '1m': 60,
+        '5m': 300, 
+        '30m': 1800,
+        '1h': 3600,
+        '6h': 21600,
+        '1d': 86400
+    }
 
     def __init__(
             self,
@@ -50,7 +66,7 @@ class PolymarketNotifBot:
 
             logger.info("Setting up scheduled tasks...")
             schedule.every(2).minutes.do(self.load_markets)
-            schedule.every(2).minutes.do(self.check_markets)
+            schedule.every(1).minutes.do(self.check_markets)
 
             logger.info("Registering command handlers...")
             self.register_handlers()
@@ -69,172 +85,286 @@ class PolymarketNotifBot:
     def load_markets(self):
         """Load all markets, making note of new markets and new cursors"""
         markets, new_cursors = self._polymarket_crawl_live_markets()
-        new_markets = {}
-        closed_markets = {}
         self.cursors += new_cursors
+
         logger.info(f"{len(markets)} live markets parsed")
+
+        # Identify newly added markets
+        new_markets = {
+            condition_id: market
+            for condition_id, market in markets.items()
+            if condition_id not in self.markets
+        }
+
+        # Identify markets that might have closed/changed acceptance since last time
+        closed_markets = {
+            condition_id: market
+            for condition_id, market in markets.items()
+            if condition_id in self.markets
+               and market["accepting_orders"] != self.markets[condition_id]["accepting_orders"]
+        }
         
-        # Go through the newly parsed markets. Check if not in object state, or if the status has now closed
-        for condition_id, market in markets.items():
-            if condition_id not in self.markets:
-                new_markets[condition_id] = market
-            if condition_id in self.markets and (market["closed"] != self.markets[condition_id]["closed"]):
-                closed_markets[condition_id] = market
-                
-        # Check if we are tracking any new markets
+        # Filter new markets by tracked config
         tracked_new_markets = self._get_tracked_markets(new_markets)
-        for condition_id, market in tracked_new_markets.items():
-            self.markets[condition_id] = market
+        # Update our in-memory dictionary
+        self.markets.update(tracked_new_markets)
 
         logger.info(f"{len(tracked_new_markets)} new tracked markets, {len(closed_markets)} closed tracked markets")
         logger.info(f"Last 5 pages scanned: {self.cursors[-5:]}")
         logger.info(f"{len(self.markets)} markets in memory")
+
         self._send_market_notification(tracked_new_markets, new=True)
         self._send_market_notification(closed_markets, new=False)
 
-        # TODO: More robust logic for tracking market closes. Currently only catches closes if on the most recent page
+
+    def _get_token_ids(self, market: Dict[str, Any]) -> Tuple[str, str]:
+        """Extract Yes/No token IDs from market data"""
+        token1, token2 = market["tokens"]
+        yes_token = token1["token_id"] if token1["outcome"] == "Yes" else token2["token_id"]
+        no_token = token1["token_id"] if token1["outcome"] == "No" else token2["token_id"]
+        return yes_token, no_token
 
 
-    def check_markets(self):
-        """Check price history of tracked markets"""
+    def _update_market_history(self, condition_id: str, 
+                               yes_history: pd.DataFrame, 
+                               no_history: pd.DataFrame) -> None:
+        """Update market price history if both histories are valid"""
+        if yes_history is not None and not yes_history.empty and no_history is not None and not no_history.empty:
+            history_data = {
+                "yes_history": yes_history,
+                "no_history": no_history
+            }
+            if "price_history" in self.markets[condition_id]:
+                self.markets[condition_id]["price_history"].update(history_data)
+            else:
+                self.markets[condition_id]["price_history"] = history_data
+
+
+    async def _fetch_market_history(self, session: aiohttp.ClientSession, 
+                                    condition_id: str, market: Dict[str, Any]) -> None:
+        """
+        Fetch and update history for a single market - sequential token fetching.
+        This method itself does 2 requests (one for "Yes" token, one for "No" token).
+        """
+        yes_token, no_token = self._get_token_ids(market)
+
+        # Optional short random sleep to distribute requests
+        await asyncio.sleep(random.uniform(0.05, 0.15))
+
+        yes_history = await self._get_price_history_async(session, yes_token, "1d")
+        no_history = await self._get_price_history_async(session, no_token, "1d")
+        self._update_market_history(condition_id, yes_history, no_history)
+
+
+    async def _check_markets_async(self) -> None:
+        """Process multiple markets concurrently with a limited number of tasks."""
+        sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)  # concurrency-limiting semaphore
+
+        async with aiohttp.ClientSession() as session:
+            # Create tasks for each market with concurrency-limiting
+            tasks = []
+            for condition_id, market in tqdm(list(self.markets.items()), 
+                                             desc="Checking market histories", 
+                                             unit="market"):
+                tasks.append(self._fetch_market_history_with_semaphore(session, sem, condition_id, market))
+            
+            await asyncio.gather(*tasks)
+
+
+    async def _fetch_market_history_with_semaphore(self, session, sem, condition_id, market):
+        """
+        A small wrapper to ensure that the concurrency-limiting semaphore is respected
+        before calling `_fetch_market_history`.
+        """
+        async with sem:
+            await self._fetch_market_history(session, condition_id, market)
+
+    # -----------------------------------------------------------------------------
+    # If you want to add an optional retry/backoff in `_get_price_history_async`
+    # for rate-limit errors (HTTP 429), you could do something like this:
+    # -----------------------------------------------------------------------------
+    async def _get_price_history_async(
+        self,
+        session: aiohttp.ClientSession,
+        token_id: str, 
+        interval: str = None, 
+        start_ts: int = None, 
+        end_ts: int = None, 
+        fidelity: int = 5,
+        retry_limit: int = 3,
+        base_backoff: float = 1.0
+    ) -> pd.Series:
+        """
+        Get price history for a market using either an interval or timestamp range.
+        Retries on 429 with exponential backoff.
+        """
+        if not interval and not (start_ts and end_ts):
+            raise ValueError("Must provide either interval or both start_ts and end_ts")
+        if interval and (start_ts or end_ts):
+            raise ValueError("Cannot provide both interval and timestamps")
+
+        attempt = 0
+        while attempt < retry_limit:
+            try:
+                params = {"market": token_id, "fidelity": fidelity}
+                if interval:
+                    params["interval"] = interval
+                else:
+                    params["startTs"] = start_ts
+                    params["endTs"] = end_ts
+
+                async with session.get(f"{POLYMARKET_HOST}/prices-history", params=params) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        df = pd.Series(
+                            [d['p'] for d in data['history']], 
+                            index=[d['t'] for d in data['history']]
+                        )
+                        return df
+                    elif response.status == 429:
+                        # Rate-limited: backoff and retry
+                        logger.warning(f"Rate-limited on token {token_id}, attempt {attempt+1}")
+                        await asyncio.sleep(base_backoff * 2**attempt)
+                        attempt += 1
+                    else:
+                        logger.error(f"Failed to fetch price history ({response.status}) for {token_id}")
+                        return None
+
+            except aiohttp.ClientError as e:
+                logger.error(f"Error fetching price history for {token_id}: {str(e)}")
+                # Might optionally retry or just exit here
+                return None
+
+        # If we got here, we retried `retry_limit` times
+        logger.error(f"Exhausted retries fetching price history for {token_id}.")
+        return None
+
+    def check_markets(self) -> None:
+        """Main method to check price history of tracked markets (entry point for schedule)."""
+        # We run the async method in a separate event loop or with asyncio.run
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(self._check_markets_async())
+        loop.close()
+
+        # After we have all updated data, let's check for changes
+        self._market_price_changes()
+
+
+    def _market_price_changes(self):
+        """Figure out if any of the markets have changed in excess of defined thresholds"""
         current_ts = int(datetime.now().timestamp())
-        interval_map = {
-            '1m': 60,
-            '5m': 300, 
-            '30m': 1800,
-            '1h': 3600,
-            '6h': 21600,
-            '1d': 86400
-        }
-        market_histories = {}
-        
-        for condition_id, market in tqdm(self.markets.items(), desc="Checking market histories", unit="market"):
-            token1 = market["tokens"][0]["token_id"]
-            token2 = market["tokens"][0]["token_id"]
-            
-            # Use last notification timestamp if exists, otherwise look back 1 day
-            start_ts = market.get("last_notification", current_ts - interval_map['1d'])
-            history = self._get_price_history(token1, start_ts, current_ts)
-            if history:
-                market_histories[condition_id] = history
-
-        # Check each configured interval using the cached history
         for interval, threshold in self.config.items():
-            if interval not in interval_map:
+            if interval not in self.INTERVAL_MAP:
                 continue 
-            interval_start = current_ts - interval_map[interval]
+            interval_start = current_ts - self.INTERVAL_MAP[interval]
             
-            # Track largest price change for this interval
-            max_price_change = 0
-            max_change_market = None
-            max_change_data = None
+            for condition_id, market in tqdm(self.markets.items(), 
+                                             desc=f"Checking {interval} price changes", 
+                                             unit="market"):
+                self._get_price_change(condition_id, market, interval, interval_start, current_ts, threshold)
+
+
+    def _get_price_change(self, condition_id: str, market: dict, interval: int, 
+                          interval_start: int, current_ts: int, threshold: float):
+        """Check whether a market's price fluctuations have exceeded the threshold."""
+        if "price_history" not in market:
+            return
+        try:
+            interval_start_market = max(interval_start, market.get("last_notification", 0))
+
+            # If we recently notified (over a different lookback window), skip
+            if (current_ts - interval_start_market) <= 10:
+                logger.info(f"Already notified for market {condition_id}")
+                return
             
-            for condition_id, history in market_histories.items():
-                interval_data = [
-                    price['p'] for price in history['history']
-                    if interval_start <= price['t'] <= current_ts
-                ]
-                if not interval_data:
-                    continue
-                    
-                # Check if price difference exceeds threshold
-                price_diff = max(interval_data) - min(interval_data)
-                
-                # Track largest price change
-                if price_diff > max_price_change:
-                    max_price_change = price_diff
-                    max_change_market = self.markets[condition_id]
-                    max_change_data = interval_data
-                
-                if price_diff >= threshold:
-                    market = self.markets[condition_id]
-                    logger.info(f"Price change recorded for market {condition_id} over {interval}")
-                    msg = f"⚠️ Price Change Alert!\n\n"
-                    msg += f"Market: {market['question']}\n"
-                    msg += f"Price changed by {price_diff:.3f} in last {interval}\n"
-                    msg += f"Range: {min(interval_data):.3f} - {max(interval_data):.3f}"
-                    self._safe_send_message(self.bot, self.chat_id, msg)
-                    
-                    # Update last notification timestamp
-                    self.markets[condition_id]["last_notification"] = current_ts
-            
-            # Log the largest price change for this interval
-            if max_change_market:
-                logger.info(
-                    f"Largest {interval} price change: {max_price_change:.3f} "
-                    f"for market: {max_change_market['question']} "
-                    f"(Range: {min(max_change_data):.3f} - {max(max_change_data):.3f})"
+            yes_interval_data = market["price_history"]["yes_history"].loc[interval_start_market:current_ts]
+            no_interval_data = market["price_history"]["no_history"].loc[interval_start_market:current_ts]
+
+            if yes_interval_data.empty or no_interval_data.empty:
+                logger.debug(f"Missing yes/no data for {condition_id} in interval.")
+                return
+
+            # Ensure both tokens show enough data for the threshold check
+            price_diff_yes = yes_interval_data.max() - yes_interval_data.min()
+            price_diff_no = no_interval_data.max() - no_interval_data.min()
+
+            # For an alert, require that BOTH tokens have sufficiently large moves?
+            # Or whichever is bigger? Decide your logic.
+            price_diff = max(price_diff_yes, price_diff_no)
+
+            if price_diff >= threshold:
+                self._send_price_notification(
+                    market, condition_id, yes_interval_data, no_interval_data, interval_start_market, interval
                 )
+                self.markets[condition_id]["last_notification"] = current_ts
+
+        except Exception as e: 
+            logger.error(f"Error on {condition_id}: {str(e)}")
+            return
 
 
     def _get_tracked_markets(self, markets: dict):
-        """Get the tracked markets based on the config"""
-        tracked_markets = {}
+        """Get the tracked markets based on config filters (tags, keywords, etc.)."""
         filter_tags = self.config.get("tags", [])
         filter_keywords = self.config.get("keywords", [])
 
-        for condition_id, market in markets.items():
-            market_tags = market.get("tags") or []
-            market_question = market.get("question", "").lower()
-
-            if any(tag in market_tags for tag in filter_tags):
-                tracked_markets[condition_id] = market
-                continue
-
-            if any(keyword.lower() in market_question for keyword in filter_keywords):
-                tracked_markets[condition_id] = market
-                continue
-
+        tracked_markets = {
+            condition_id: market for condition_id, market in markets.items()
+            if any(tag in (market.get("tags") or []) for tag in filter_tags)
+               or any(keyword.lower() in market.get("question", "").lower() for keyword in filter_keywords)
+        }
         return tracked_markets
 
 
     def _polymarket_crawl_live_markets(self) -> tuple[dict, list[str]]:
-        """Crawl from the cursor given to the end of the markets tab"""
+        """Crawl from the cursor given to the end of the markets tab, accumulating all active markets."""
         markets = {}
         cursors_collected = []
 
+        # Start from a default or from a point close to last known
         if not self.cursors: 
             current_cursor = "MA=="
         else: 
-            current_cursor = self.cursors[-1]
+            current_cursor = self.cursors[-5]  # start from the 5th to last cursor to catch changes
 
         while True: 
             data, nxt = _polymarket_get_markets_page(current_cursor)
-            if data: 
-                for market in data: 
+            if data:
+                for market in data:
+                    # Filter out inactive or closed or non-accepting
                     if market["active"] and not market["closed"] and market["accepting_orders"]:
                         condition_id = market["condition_id"]
                         markets[condition_id] = market
+            
             if current_cursor not in self.cursors:
                 cursors_collected.append(current_cursor)
-            if not nxt or nxt=="LTE=":
+            
+            if not nxt or nxt == "LTE=":
                 break
             current_cursor = nxt
 
         return markets, cursors_collected
     
 
-    def _get_price_history(self, token_id: str, start_ts: int, end_ts: int) -> dict:
-        """Get price history for a market between timestamps"""
-        try:
-            response = requests.get(
-                f"{POLYMARKET_GAMMA_HOST}/prices-history",
-                params={
-                    "market": token_id,
-                    "startTs": start_ts, 
-                    "endTs": end_ts,
-                    "fidelity": 1
-                }
-            )
-            if response.status_code == 200:
-                return response.json()
-        except (requests.RequestException, ValueError) as e:
-            print(f"Error fetching price history for {token_id}: {str(e)}")
-        return None
-    
+    def _safe_send_message(self, bot, chat_id, text, retries=3, delay=5):
+        """
+        Send a message with retry logic for network issues.
+        """
+        attempt = 0
+        while attempt < retries:
+            try:
+                bot.send_message(chat_id=chat_id, text=text)
+                return
+            except (TimedOut, NetworkError) as e:
+                attempt += 1
+                logger.warning(f"Send message attempt {attempt} failed: {e}. Retrying in {delay} seconds...")
+                time.sleep(delay)
+        logger.error(f"Failed to send message after {retries} attempts.")
+
 
     def _send_market_notification(self, changed_markets: dict, new: bool):
-        """Send notifications of new or closed markets, new is a boolean for which notif to send"""
+        """Send notifications of new or closed markets."""
         for condition_id, market in changed_markets.items():
             logger.info(f"Market {'added' if new else 'closed'}: {condition_id}")
             formatted_market = polymarket_format_market(market)
@@ -246,8 +376,49 @@ class PolymarketNotifBot:
             self._safe_send_message(self.bot, self.chat_id, text)
 
 
+    def _send_price_notification(self, market: dict, condition_id: str, 
+                                 yes_interval_data: pd.Series, no_interval_data: pd.Series, 
+                                 interval_start_market: int, interval: int):
+        """Send a notification about significant price change in a market."""
+        logger.info(f"Price change recorded for market {condition_id} over {interval}")
+
+        # Find max/min/time for YES
+        yes_max_price = yes_interval_data.max()
+        yes_min_price = yes_interval_data.min()
+        yes_max_time = datetime.fromtimestamp(yes_interval_data.idxmax())
+        yes_min_time = datetime.fromtimestamp(yes_interval_data.idxmin())
+
+        # Find max/min/time for NO
+        no_max_price = no_interval_data.max()
+        no_min_price = no_interval_data.min()
+        no_max_time = datetime.fromtimestamp(no_interval_data.idxmax())
+        no_min_time = datetime.fromtimestamp(no_interval_data.idxmin())
+
+        # Price changes from earliest to most recent
+        yes_price_change = yes_interval_data.iloc[-1] - yes_interval_data.iloc[0]
+        no_price_change = no_interval_data.iloc[-1] - no_interval_data.iloc[0]
+
+        msg = f"⚠️ Price Change Alert ({interval} interval):\n"
+        msg += f"Market: {market['question']}\n"
+        msg += f"Condition ID: {market['condition_id']}\n"
+        msg += f"\nYES Token:\n"
+        msg += f"  Max: {yes_max_price:.3f} at {yes_max_time.strftime('%H:%M:%S')}\n"
+        msg += f"  Min: {yes_min_price:.3f} at {yes_min_time.strftime('%H:%M:%S')}\n"
+        msg += f"  Change: {'+' if yes_price_change > 0 else ''}{yes_price_change:.3f}\n"
+        msg += f"\nNO Token:\n"
+        msg += f"  Max: {no_max_price:.3f} at {no_max_time.strftime('%H:%M:%S')}\n"
+        msg += f"  Min: {no_min_price:.3f} at {no_min_time.strftime('%H:%M:%S')}\n"
+        msg += f"  Change: {'+' if no_price_change > 0 else ''}{no_price_change:.3f}\n"
+
+        self._safe_send_message(self.bot, self.chat_id, msg)
+
+
     def _update_config(self, param: str, new_config: str) -> str:
-        """Update the config dictionary from a Telegram command."""
+        """
+        Update the config dictionary from a Telegram command.
+        If param is in ("tags","keywords"), treat as string list membership.
+        Otherwise, attempt to parse a float for thresholds.
+        """
         if param in ("tags", "keywords"):
             if new_config in self.config[param]:
                 self.config[param].remove(new_config)
@@ -262,23 +433,26 @@ class PolymarketNotifBot:
                 return f"New {param} is {val}."
             except ValueError:
                 return f"Invalid numeric value: {new_config}"
-
+            
 
     def register_handlers(self):
         """Register all command handlers for the Telegram Bot."""
         logger.info("Setting up command handlers...")
+
         # /help
         self.dispatcher.add_handler(
             CommandHandler("help", lambda update, context: self._safe_send_message(
                 self.bot, self.chat_id, self.get_help()
             ))
         )
+
         # /show_config
         self.dispatcher.add_handler(
             CommandHandler("show_config", lambda update, context: self._safe_send_message(
                 self.bot, self.chat_id, str(self.config)
             ))
         )
+
         # /update_config <param> <value>
         def update_config_cmd(update: Update, context: CallbackContext):
             if len(context.args) < 2:
@@ -289,6 +463,7 @@ class PolymarketNotifBot:
             self._safe_send_message(self.bot, self.chat_id, response)
 
         self.dispatcher.add_handler(CommandHandler("update_config", update_config_cmd))
+
         # /market <condition_id>
         def show_market_cmd(update: Update, context: CallbackContext):
             if not context.args:
@@ -300,24 +475,15 @@ class PolymarketNotifBot:
                 self._safe_send_message(self.bot, self.chat_id, polymarket_format_market(market))
             else:
                 self._safe_send_message(self.bot, self.chat_id, f"No tracked market found for {cid}.")
+
         self.dispatcher.add_handler(CommandHandler("market", show_market_cmd))
 
-
-    def _safe_send_message(self, bot, chat_id, text, retries=3, delay=5):
-        """
-        Send a message with retry logic for network issues.
-        Use the official bot.send_message method (not bot._send_message).
-        """
-        attempt = 0
-        while attempt < retries:
-            try:
-                bot.send_message(chat_id=chat_id, text=text)
-                return  # Success, exit after sending
-            except (TimedOut, NetworkError) as e:
-                attempt += 1
-                logger.warning(f"Send message attempt {attempt} failed: {e}. Retrying in {delay} seconds...")
-                time.sleep(delay)
-        logger.error(f"Failed to send message after {retries} attempts.")
+        # /show_tracked_markets
+        self.dispatcher.add_handler(
+            CommandHandler("show_tracked_markets", lambda update, context: self._safe_send_message(
+                self.bot, self.chat_id, ", ".join(self.markets.keys())
+            ))
+        )
 
 
     def get_help(self) -> str:
@@ -328,12 +494,9 @@ class PolymarketNotifBot:
             "/market <id> - Show details for a specific market\n"
             "/show_config - Show current Polymarket configuration\n"
             "/update_config <param> <value> - Update a config parameter\n"
-            # "/list_attributes <attr1,attr2,...> - List specified attributes for all markets\n"
-            # "/show_attributes - Show all available market attributes\n"
-            # "/volume <min> - List markets with volume above threshold\n"
-            # "/spread <max> - List markets with bid-ask spread below threshold"
+            "/show_tracked_markets - List condition IDs of tracked markets\n"
         )
-
+    
 
     def start(self):
         """Start the bot and keep scheduling running."""
@@ -348,12 +511,12 @@ class PolymarketNotifBot:
 
 def _polymarket_get_markets_page(cursor: str):
     """
-    Get a given page in the polymarket markets
+    Get a given page in the Polymarket markets.
     
-    Params: 
-        cursor (str): the cursor of the mkt page we are on
-    Returns: 
-        (data, nxt): the data associated with the market and the 
+    Returns:
+        (data, nxt): 
+            data - the list of markets
+            nxt - the cursor to fetch the next page
     """
     client = ClobClient(POLYMARKET_HOST)
     response = client.get_markets(next_cursor=cursor)
@@ -365,9 +528,16 @@ def _polymarket_get_markets_page(cursor: str):
 def polymarket_format_market(market: dict) -> str:
     """Format market data into a readable message string."""
     question = market.get('question', 'N/A')
-    price = market.get('tokens')
-    formatted_price = ", ".join([f"{token['outcome']}: ${token['price']}" for token in price])
+    token_data = market.get('tokens', [])
+    formatted_price = ", ".join([f"{token['outcome']}: ${token.get('price', 'N/A')}" for token in token_data])
     tags = ', '.join(market.get('tags', []))
     condition_id = market["condition_id"]
     
-    return f"Condition ID: {condition_id}\nQuestion: {question}\Tokens: ${formatted_price}\nTags: {tags}"
+    return (
+        f"Condition ID: {condition_id}\n"
+        f"Question: {question}\n"
+        f"Tokens: {formatted_price}\n"
+        f"Tags: {tags}"
+    )
+
+
